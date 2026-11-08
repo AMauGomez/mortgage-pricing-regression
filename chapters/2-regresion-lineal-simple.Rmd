@@ -1,0 +1,232 @@
+---
+title: "2. Regresión lineal simple"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+```
+
+*Temario: unidades 2.1 y 2.2 (Modelos No Paramétricos y de Regresión, clave 1639).*
+
+## 2.1 Panorama: para qué sirve una regresión aquí
+
+Una regresión describe cómo cambia, en promedio, una variable respuesta cuando cambian otras. En crédito sirve para dos cosas distintas: **explicar** (¿cuánto encarece un FICO bajo?) y **predecir** (¿qué tasa le tocará a este cliente?). Las dos piden cosas diferentes del modelo, como veremos con los intervalos de confianza y de predicción.
+
+En este capítulo usamos una sola variable explicativa, el FICO, y **un solo mes**: diciembre de 2024. La razón viene del capítulo 0: la tasa del mercado cambió casi un punto en el año. Si mezcláramos meses, parte de lo que atribuyéramos al FICO sería en realidad el mercado.
+
+```{r}
+hipotecas <- leer_hipotecas()
+dic <- hipotecas |> filter(mes == "202412")
+n <- nrow(dic)
+c(creditos = n, tasa_promedio = mean(dic$tasa), fico_promedio = mean(dic$fico))
+```
+
+## 2.2 El modelo de regresión lineal simple
+
+### 2.2.1 Introducción
+
+$$
+Y_i = \beta_0 + \beta_1 x_i + \varepsilon_i, \qquad E[\varepsilon_i] = 0, \quad \operatorname{Var}(\varepsilon_i) = \sigma^2, \quad \varepsilon_i \text{ no correlacionados},
+$$
+
+donde $Y_i$ es la tasa del crédito $i$ y $x_i$ su FICO. Para la inferencia exacta se agrega $\varepsilon_i \sim N(0, \sigma^2)$.
+
+Por los términos de uso de los datos no mostramos un diagrama de dispersión (cada punto sería un crédito). En su lugar, el promedio de la tasa en grupos de 10 puntos de FICO, que además se lee mejor con miles de datos:
+
+```{r, fig.height = 4}
+por_fico <- dic |> mutate(grupo = 10 * floor(fico / 10) + 5) |>
+  group_by(grupo) |> summarise(tasa = mean(tasa), creditos = n()) |> filter(creditos >= 20)
+ggplot(por_fico, aes(grupo, tasa)) +
+  geom_point(aes(size = creditos), colour = AZUL) +
+  geom_smooth(data = dic, aes(fico, tasa), method = "lm", se = FALSE, colour = ROJO, linewidth = 0.8) +
+  labs(x = "FICO", y = "Tasa promedio (%)", size = "créditos",
+       title = "Diciembre de 2024: tasa promedio por grupo de FICO", subtitle = "Línea roja: recta de mínimos cuadrados")
+```
+
+### 2.2.2 Estimación por mínimos cuadrados
+
+Los estimadores minimizan $\sum (Y_i - \beta_0 - \beta_1 x_i)^2$:
+
+$$
+\hat\beta_1 = \frac{S_{xy}}{S_{xx}} = \frac{\sum (x_i - \bar x)(Y_i - \bar Y)}{\sum (x_i - \bar x)^2}, \qquad \hat\beta_0 = \bar Y - \hat\beta_1 \bar x .
+$$
+
+```{r}
+x <- dic$fico; y <- dic$tasa
+Sxx <- sum((x - mean(x))^2); Sxy <- sum((x - mean(x)) * (y - mean(y)))
+b1 <- Sxy / Sxx; b0 <- mean(y) - b1 * mean(x)
+modelo <- lm(tasa ~ fico, data = dic)
+rbind(a_mano = c(b0, b1), lm = coef(modelo))
+c(pb_por_20_puntos_de_FICO = 100 * 20 * b1)
+```
+
+Cada 20 puntos más de FICO, la tasa baja en promedio `r round(-100 * 20 * b1, 1)` puntos base.
+
+### 2.2.3 Teorema de Gauss y Markov
+
+Si los errores tienen media cero, varianza constante y no están correlacionados, los estimadores de mínimos cuadrados son los **mejores estimadores lineales insesgados** (MELI): de todos los estimadores que son combinaciones lineales de las $Y_i$ y no tienen sesgo, son los de menor varianza. **No requiere normalidad**, lo cual importa aquí, porque la tasa no es normal (capítulo 1). Sí requiere varianza constante, que revisamos en 2.2.13.
+
+### 2.2.4 Propiedades de los estimadores
+
+$$
+\operatorname{Var}(\hat\beta_1) = \frac{\sigma^2}{S_{xx}}, \qquad
+\operatorname{Var}(\hat\beta_0) = \sigma^2\left(\frac{1}{n} + \frac{\bar x^2}{S_{xx}}\right), \qquad
+\hat\sigma^2 = \frac{SCE}{n - 2}.
+$$
+
+```{r}
+residuales <- y - (b0 + b1 * x)
+sigma2 <- sum(residuales^2) / (n - 2)
+rbind(a_mano = c(se_b0 = sqrt(sigma2 * (1 / n + mean(x)^2 / Sxx)), se_b1 = sqrt(sigma2 / Sxx)),
+      lm = coef(summary(modelo))[, "Std. Error"])
+```
+
+### 2.2.5 Estimación por máxima verosimilitud
+
+Con errores normales, maximizar la verosimilitud da **los mismos** $\hat\beta_0, \hat\beta_1$ que mínimos cuadrados, porque maximizar $-\sum(Y_i - \beta_0 - \beta_1 x_i)^2/(2\sigma^2)$ es minimizar la suma de cuadrados. Lo que cambia es la varianza: el EMV es $SCE/n$, sesgado; el estimador insesgado divide entre $n-2$.
+
+```{r}
+negloglik <- function(par) -sum(dnorm(y, par[1] + par[2] * x, exp(par[3]), log = TRUE))
+emv <- optim(c(mean(y), 0, log(sd(y))), negloglik, method = "BFGS", control = list(maxit = 1000, reltol = 1e-12))
+rbind(emv = c(emv$par[1:2], sigma2 = exp(emv$par[3])^2), minimos_cuadrados = c(b0, b1, sigma2 = sigma2))
+```
+
+### 2.2.6 Descomposición fundamental del análisis de varianza
+
+$$
+\underbrace{\sum (Y_i - \bar Y)^2}_{SCT} = \underbrace{\sum (\hat Y_i - \bar Y)^2}_{SCR} + \underbrace{\sum (Y_i - \hat Y_i)^2}_{SCE}.
+$$
+
+```{r}
+ajustados <- b0 + b1 * x
+c(SCT = sum((y - mean(y))^2), SCR = sum((ajustados - mean(y))^2), SCE = sum(residuales^2))
+```
+
+### 2.2.7 Coeficientes de correlación y de determinación
+
+```{r}
+c(r = cor(x, y), R2 = cor(x, y)^2, R2_por_anova = sum((ajustados - mean(y))^2) / sum((y - mean(y))^2))
+```
+
+El FICO explica solo una parte pequeña de la variación de la tasa **entre créditos del mismo mes**, aunque su efecto sea claro. No es contradictorio: el $R^2$ mide qué tanto de la dispersión individual explica el modelo, no si el efecto existe. La tasa depende de muchas otras cosas (enganche, propósito, prestamista, y de algo que la base no registra: si el cliente pagó **puntos** para bajar su tasa).
+
+### 2.2.8 Intervalos de confianza para los parámetros
+
+$$
+\hat\beta_1 \pm t_{n-2,\,0.975}\,\operatorname{ee}(\hat\beta_1)
+$$
+
+```{r}
+t975 <- qt(0.975, n - 2)
+rbind(a_mano = b1 + c(-1, 1) * t975 * sqrt(sigma2 / Sxx), confint = confint(modelo)["fico", ]) * 100 * 20
+```
+
+En puntos base por cada 20 puntos de FICO.
+
+### 2.2.9 Intervalo de confianza para la respuesta media
+### 2.2.10 Intervalo de predicción
+
+¿Qué tasa esperar para un acreditado con FICO de 680 y para uno de 780?
+
+```{r}
+nuevos <- data.frame(fico = c(680, 780))
+cbind(nuevos,
+      media = predict(modelo, nuevos, interval = "confidence"),
+      prediccion = predict(modelo, nuevos, interval = "prediction")[, -1])
+```
+
+El intervalo para la **tasa promedio** de todos los acreditados con ese FICO es angosto; el de **predicción** para un acreditado concreto es enorme, de casi dos puntos de ancho. Para *explicar* (cuánto cuesta un FICO bajo en promedio) el modelo es útil; para *predecir* la tasa de una persona, no.
+
+### 2.2.11 Prueba de significancia global
+
+```{r}
+anova(modelo)
+c(F = anova(modelo)$`F value`[1], t_al_cuadrado = coef(summary(modelo))["fico", "t value"]^2)
+```
+
+En regresión simple, la prueba $F$ global y la prueba $t$ de la pendiente son la misma: $F = t^2$.
+
+### 2.2.12 Transformaciones
+
+Las tablas de precio de la industria asignan un ajuste a cada **banda** de FICO, así que cabría esperar que la tasa bajara por escalones y no como una recta. Comparemos la recta con dos alternativas: un término cuadrático y bandas de FICO (variables indicadoras).
+
+```{r}
+dic <- dic |> mutate(banda = banda_fico(fico))
+por_bandas <- lm(tasa ~ banda, data = dic)
+cuadratico <- lm(tasa ~ poly(fico, 2), data = dic)
+c(R2_recta = summary(modelo)$r.squared, R2_cuadratico = summary(cuadratico)$r.squared, R2_bandas = summary(por_bandas)$r.squared)
+c(AIC_recta = AIC(modelo), AIC_cuadratico = AIC(cuadratico), AIC_bandas = AIC(por_bandas))
+```
+
+En un solo mes, **la recta gana**: las bandas apenas suben el $R^2$ y el criterio de Akaike, que penaliza los parámetros extra, prefiere la recta. La gráfica de 2.2.1 lo muestra: salvo en los grupos de FICO bajo, que tienen pocos créditos, los promedios siguen la recta de cerca. Los escalones de las tablas de precio existen, pero se difuminan en los promedios: cada prestamista tiene su propia tabla, y los acreditados pueden pagar puntos para bajar la tasa. Transformar la respuesta (por ejemplo, con logaritmo) no tiene mucho sentido aquí: la tasa ya está en una escala en la que las diferencias se interpretan directamente.
+
+### 2.2.13 Análisis de residuales
+
+```{r, fig.height = 3.8}
+dic$residual <- residuals(modelo); dic$ajustado <- fitted(modelo)
+dic |> mutate(grupo = cut(ajustado, unique(quantile(ajustado, 0:20 / 20)), include.lowest = TRUE)) |>
+  group_by(grupo) |> summarise(ee = sd(residual) / sqrt(n()), ajustado = mean(ajustado), residual = mean(residual)) |>
+  ggplot(aes(ajustado, residual)) + geom_hline(yintercept = 0, linetype = 2, colour = GRIS) +
+  geom_pointrange(aes(ymin = residual - 2 * ee, ymax = residual + 2 * ee), colour = AZUL) +
+  labs(x = "Valor ajustado (grupos de igual tamaño)", y = "Residual promedio ± 2 errores estándar",
+       title = "Residuales contra ajustados, agrupados")
+```
+
+```{r, fig.height = 3.8}
+qq <- data.frame(teorico = qnorm(ppoints(n)), observado = sort(scale(dic$residual)[, 1]))
+ggplot(qq, aes(teorico, observado)) + geom_abline(colour = GRIS) + geom_line(colour = AZUL) +
+  labs(x = "Cuantiles normales", y = "Residuales estandarizados", title = "Gráfica cuantil-cuantil de los residuales")
+lmtest::bptest(modelo)
+```
+
+Tres lecturas:
+
+- Los residuales promedio por grupo oscilan alrededor de cero, sin una curva clara: la recta describe bien la tendencia promedio dentro del mes.
+- La gráfica cuantil-cuantil tiene **escalones** y colas más pesadas que la normal: es la discretización de las tasas del capítulo 1. Con miles de datos, el teorema del límite central protege la inferencia sobre los coeficientes, pero los intervalos de predicción, que sí dependen de la forma de los errores, no son confiables.
+- La prueba de Breusch y Pagan evalúa si la varianza cambia con el FICO; si se rechaza, Gauss y Markov ya no garantiza que mínimos cuadrados sea el mejor, y conviene usar errores estándar robustos (capítulo 3).
+
+### 2.2.14 Pruebas F para carencia de ajuste
+
+Muchos créditos tienen **exactamente el mismo FICO**. Eso permite separar el error en dos partes: el **error puro** (cuánto varían las tasas entre créditos con el mismo FICO) y la **carencia de ajuste** (cuánto se alejan los promedios de cada FICO de la recta). Si la recta fuera correcta, la carencia de ajuste sería comparable al error puro.
+
+```{r}
+saturado <- lm(tasa ~ factor(fico), data = dic)      # un promedio por cada valor de FICO
+c(valores_distintos_de_FICO = length(unique(dic$fico)))
+anova(modelo, saturado)
+```
+
+La carencia de ajuste es significativa al 5%, pero por poco: hay `r length(unique(dic$fico))` valores distintos de FICO y el estadístico $F$ está cerca de 1. La evidencia contra la recta es **moderada** y viene sobre todo de los FICO bajos, donde hay pocos créditos por valor. Junto con 2.2.12: dentro de un mes, la recta es una descripción razonable. En el capítulo 3, con todo el año y ajustando por el mes, volveremos a comparar recta y bandas con mucha más información.
+
+### 2.2.15 Forma matricial del modelo lineal simple
+
+$$
+\mathbf{Y} = \mathbf{X}\boldsymbol\beta + \boldsymbol\varepsilon, \qquad \hat{\boldsymbol\beta} = (\mathbf{X}^\top\mathbf{X})^{-1}\mathbf{X}^\top\mathbf{Y}, \qquad \widehat{\operatorname{Var}}(\hat{\boldsymbol\beta}) = \hat\sigma^2(\mathbf{X}^\top\mathbf{X})^{-1}.
+$$
+
+```{r}
+X <- cbind(1, x)
+XtX_inv <- solve(t(X) %*% X)
+beta <- XtX_inv %*% t(X) %*% y
+rbind(beta_matricial = drop(beta), lm = coef(modelo))
+sqrt(diag(sigma2 * XtX_inv))
+```
+
+### 2.2.16 Uso de un paquete estadístico
+
+Todo lo anterior lo hace `lm()` con `summary()`, `anova()`, `confint()` y `predict()`. Hacerlo a mano una vez sirve para saber qué significa cada número que imprime el paquete:
+
+```{r}
+summary(modelo)
+```
+
+## Lo que sabemos al terminar la regresión simple
+
+- Dentro de un mismo mes, cada 20 puntos más de FICO bajan la tasa en promedio unos `r round(-100 * 20 * b1, 1)` puntos base (IC 95%: `r round(-100 * 20 * confint(modelo)["fico", 2], 1)` a `r round(-100 * 20 * confint(modelo)["fico", 1], 1)`).
+- El efecto es claro, pero el FICO explica solo `r round(100 * summary(modelo)$r.squared, 1)`% de la variación de la tasa entre créditos: la tasa depende de mucho más.
+- La recta describe bien el promedio dentro del mes; la evidencia de que haga falta otra forma es moderada.
+- La varianza no es constante (Breusch y Pagan) y los residuales tienen la forma escalonada de las tasas discretas: la inferencia sobre la pendiente es confiable con estos tamaños de muestra, los intervalos de predicción individuales no tanto.
+
+Lo que falta: este capítulo usó un mes para que el mercado no se mezclara con el FICO. Para usar los 12 meses y todas las demás características a la vez, hace falta la **regresión múltiple**.

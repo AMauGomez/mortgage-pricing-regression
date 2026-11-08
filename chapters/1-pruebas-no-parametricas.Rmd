@@ -1,0 +1,232 @@
+---
+title: "1. Pruebas no paramétricas"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+```
+
+*Temario: unidad 1 (Modelos No Paramétricos y de Regresión, clave 1639).*
+
+Las pruebas no paramétricas no suponen que los datos sigan una distribución particular (por ejemplo, la normal). Son el pan de cada día cuando los datos son asimétricos, discretos o con valores atípicos. Antes de modelar, las usamos para conocer los datos y hacer las primeras comparaciones.
+
+```{r}
+hipotecas <- leer_hipotecas()
+n <- nrow(hipotecas)
+n
+```
+
+**Una advertencia que recorre todo el capítulo.** Con `r format(n, big.mark = ",")` créditos, casi cualquier diferencia, por pequeña que sea, resulta estadísticamente significativa. En cada prueba reportamos también **el tamaño de la diferencia**, en puntos base (pb; 1 pb = 0.01 puntos porcentuales de tasa). Para darle escala: en un crédito de 300,000 dólares a 30 años, cada punto base cuesta unos `r round(costo_pb(1)[["por_mes"]], 2)` dólares al mes.
+
+## 1.1 Pruebas binomiales
+
+### 1.1.1 Prueba para proporciones
+
+Se dice que el alza de precios dejó fuera a los compradores primerizos. ¿Son al menos un tercio de los compradores?
+
+```{r}
+compras <- hipotecas |> filter(proposito == "Compra")
+x <- sum(compras$primer_comprador); m <- nrow(compras)
+binom.test(x, m, p = 1/3, alternative = "greater")
+```
+
+La prueba binomial compara el número observado de éxitos con una Binomial$(m, p_0)$. La proporción de primerizos entre las compras es `r round(100 * x / m, 1)`%, muy por encima de un tercio: casi la mitad de quienes compraron casa con un crédito de Freddie Mac en este periodo lo hacían por primera vez.
+
+### 1.1.2 Prueba para cuantiles
+
+En la prensa de 2024 se repetía que las hipotecas "andaban en 6.5%". Si la mediana fuera 6.5%, la mitad de los créditos estaría arriba. La prueba de cuantiles cuenta cuántos quedan arriba y aplica la binomial con $p = 0.5$ (los créditos exactamente en 6.5% se descartan, como en la prueba de signos):
+
+```{r}
+arriba <- sum(hipotecas$tasa > 6.5); abajo <- sum(hipotecas$tasa < 6.5)
+c(arriba = arriba, abajo = abajo, exactamente_6.5 = sum(hipotecas$tasa == 6.5))
+binom.test(arriba, arriba + abajo, p = 0.5)
+```
+
+Alrededor de 70% de los créditos (sin contar los que están justo en 6.5%) tienen una tasa mayor: la mediana del periodo fue más alta que la cifra que se repetía. Fíjate en el detalle técnico: `r format(sum(hipotecas$tasa == 6.5), big.mark = ",")` créditos están **exactamente** en 6.5%. Con datos discretos, los empates con el valor hipotético no son raros y hay que decidir qué hacer con ellos.
+
+### 1.1.3 Prueba de signos (muestras pareadas)
+
+¿Los brókers cobran más que el banco directo? Para no confundir el canal con el mercado, **emparejamos por mes**: en cada uno de los 12 meses comparamos la tasa de bróker con la del banco directo. Es un diseño **pareado**: el mes es la "persona" que aporta una observación a cada grupo.
+
+Primero un aviso práctico: si comparamos **medianas** mensuales, como las tasas viven en una rejilla discreta (sección 1.3.1), las dos medianas coinciden en la mayoría de los meses y esos empates se descartan. Por eso usamos el **promedio** mensual de cada canal:
+
+```{r}
+pares <- hipotecas |> filter(canal %in% c("Banco directo", "Bróker")) |>
+  group_by(mes, canal) |> summarise(promedio = mean(tasa), .groups = "drop") |>
+  pivot_wider(names_from = canal, values_from = promedio) |>
+  mutate(diferencia_pb = 100 * (`Bróker` - `Banco directo`))
+pares |> select(mes, diferencia_pb)
+mas <- sum(pares$diferencia_pb > 0); menos <- sum(pares$diferencia_pb < 0)
+binom.test(mas, mas + menos, p = 0.5)
+```
+
+La prueba de signos solo usa el *signo* de cada diferencia: no supone nada sobre su tamaño ni su distribución. Con 12 meses tiene poca potencia, pero es honesta sobre lo que el diseño permite concluir: mes por mes, los brókers no cobran sistemáticamente más ni menos que el banco directo.
+
+### 1.1.4 Prueba de McNemar
+
+Freddie Mac exige un **seguro hipotecario** cuando el acreditado pone menos de 20% de enganche (LTV mayor a 80). Cada crédito tiene así dos clasificaciones: "LTV > 80" y "tiene seguro". Si los datos son consistentes, deberían coincidir. McNemar compara los dos tipos de **desacuerdo** en una misma muestra:
+
+```{r}
+tabla_mi <- table(LTV_mayor_80 = hipotecas$ltv > 80, tiene_seguro = hipotecas$seguro_hipotecario)
+tabla_mi
+mcnemar.test(tabla_mi)
+```
+
+Los desacuerdos son muy pocos frente a casi 50,000 créditos, pero no son simétricos: hay más créditos con LTV mayor a 80 *sin* seguro que al revés. Una prueba no paramétrica sirve aquí como **revisión de calidad de datos**. Esos casos pueden deberse a programas especiales o a cómo se redondea el LTV; la base no lo explica, y no lo afirmamos.
+
+### 1.1.5 Prueba de Cox y Stuart
+
+¿La tasa tuvo una **tendencia** en el año? La prueba de Cox y Stuart parte la serie en dos mitades, empareja el primer mes de cada mitad, el segundo, etc., y aplica la prueba de signos a esas diferencias:
+
+```{r}
+serie <- hipotecas |> group_by(mes) |> summarise(mediana = median(tasa)) |> pull(mediana)
+k <- length(serie) %/% 2
+dif <- serie[(length(serie) - k + 1):length(serie)] - serie[1:k]
+c(subidas = sum(dif > 0), bajadas = sum(dif < 0), empates = sum(dif == 0))
+binom.test(sum(dif > 0), sum(dif != 0), p = 0.5)
+```
+
+No hay evidencia de una tendencia **monótona**, y es correcto: la tasa subió hasta el verano y luego bajó. Cox y Stuart detecta tendencias en una sola dirección; una serie que sube y baja no es "sin cambios", es una tendencia que esta prueba no está diseñada para ver.
+
+## 1.2 Pruebas de rango
+
+### 1.2.1 Prueba de Mann y Whitney
+
+Bróker contra banco directo, ahora con todos los créditos (muestras **independientes**: créditos distintos):
+
+```{r}
+bd <- hipotecas |> filter(canal %in% c("Banco directo", "Bróker")) |> droplevels()
+wilcox.test(tasa ~ canal, data = bd, conf.int = TRUE)
+```
+
+La prueba compara los rangos de las dos muestras y resulta significativa al 5%. Pero mira la **diferencia estimada** (estimador de Hodges y Lehmann): es prácticamente **cero puntos base**, y su intervalo de confianza sale degenerado porque, con tantos empates, la mediana de las diferencias entre pares es exactamente 0. Es el ejemplo más claro de este capítulo: **significativo no es lo mismo que relevante**. Las distribuciones difieren en su forma (lo vemos en 1.2.3), no en un desplazamiento de la tasa. Y además esta comparación **no** controla el mes ni el riesgo del acreditado.
+
+### 1.2.2 Prueba de Kruskal y Wallis
+
+¿Cambia la tasa con la calificación de crédito? Comparamos las bandas de FICO, que es como la industria agrupa a los acreditados:
+
+```{r}
+hipotecas <- hipotecas |> mutate(banda = banda_fico(fico))
+hipotecas |> group_by(banda) |> summarise(creditos = n(), mediana = median(tasa), promedio = mean(tasa))
+kruskal.test(tasa ~ banda, data = hipotecas)
+```
+
+La diferencia entre bandas es clara: la tasa promedio baja a medida que sube el FICO. Y entre canales:
+
+```{r}
+kruskal.test(tasa ~ canal, data = hipotecas)
+```
+
+### 1.2.3 Prueba para la varianza de más de dos poblaciones
+
+¿Los tres canales tienen la misma **dispersión** de tasas? La prueba de Fligner y Killeen usa rangos y es robusta a la falta de normalidad (por eso se prefiere a Bartlett). Además, decide qué prueba de localización conviene: si las varianzas difieren mucho, comparar medianas con Kruskal y Wallis es más delicado.
+
+```{r}
+hipotecas |> group_by(canal) |> summarise(desviacion_estandar = sd(tasa), rango_intercuartilico = IQR(tasa))
+fligner.test(tasa ~ canal, data = hipotecas)
+```
+
+## 1.3 Pruebas de bondad de ajuste
+
+### 1.3.1 Prueba de la ji cuadrada: las tasas vienen redondeadas
+
+Las tasas hipotecarias se cotizan en **octavos de punto** (6.125, 6.25, 6.375, ...). Veamos la parte fraccionaria de cada tasa, medida en octavos:
+
+```{r}
+octavos <- round((hipotecas$tasa %% 1) * 8, 2)
+en_rejilla <- octavos %in% 0:7
+c(en_octavos_exactos = mean(en_rejilla), fuera_de_la_rejilla = mean(!en_rejilla))
+table(octavo = octavos[en_rejilla])
+```
+
+¿Todos los octavos son igual de frecuentes? La ji cuadrada compara las frecuencias observadas con las esperadas bajo uniformidad:
+
+```{r}
+chisq.test(table(octavos[en_rejilla]))
+```
+
+Se rechaza con mucha claridad: unas terminaciones son mucho más comunes que otras. Y uno de cada cuatro créditos ni siquiera está en la rejilla de octavos. ¿Qué terminaciones tienen?
+
+```{r}
+fuera <- hipotecas$tasa[!en_rejilla]
+terminacion <- sprintf("%.3f", round(fuera %% 1, 3))
+head(sort(table(terminacion), decreasing = TRUE), 6)
+```
+
+La mayoría son terminaciones como .990, .490 o .999, y otras quedan un milésimo abajo de un octavo (.624, .124): precios "psicológicos", como 6.99% en lugar de 7%. Esto importa para lo que sigue: **la tasa es una variable discreta con muchísimos empates**.
+
+### 1.3.2 y 1.3.3 Kolmogorov y Lilliefors: ¿la tasa es normal?
+
+```{r}
+ks_ingenua <- suppressWarnings(ks.test(hipotecas$tasa, "pnorm", mean(hipotecas$tasa), sd(hipotecas$tasa)))
+lilliefors <- nortest::lillie.test(hipotecas$tasa)
+c(D_kolmogorov = unname(ks_ingenua$statistic), p_kolmogorov = ks_ingenua$p.value, p_lilliefors = lilliefors$p.value)
+```
+
+Dos problemas con la prueba de Kolmogorov aquí:
+
+1. Supone una distribución **completamente especificada**; si se estiman la media y la varianza con los mismos datos, el valor p es demasiado grande. La corrección es la prueba de **Lilliefors**.
+2. Supone una distribución **continua**, y nuestra tasa tiene muchísimos empates (los octavos). R lo advierte.
+
+Con miles de datos y empates masivos, la normalidad se rechaza siempre. Lo importante viene en el capítulo 2: la regresión no necesita que la *respuesta* sea normal, sino que lo sean, aproximadamente, los *errores*, y con muestras grandes ni siquiera eso es crítico para la inferencia sobre los coeficientes.
+
+### 1.3.4 Prueba exponencial
+
+No aplica a una tasa de interés, pero la usamos a fondo en el caso de estudio de Inferencia (tiempos entre atropellamientos en la CDMX), donde la exponencialidad era el modelo central.
+
+### 1.3.5 Estadísticas más usadas
+
+Además de Kolmogorov, las estadísticas de **Anderson y Darling** (que da más peso a las colas) y de **Cramér y von Mises** (que integra toda la diferencia entre distribuciones):
+
+```{r}
+c(anderson_darling = nortest::ad.test(hipotecas$tasa)$statistic,
+  cramer_von_mises = nortest::cvm.test(hipotecas$tasa)$statistic)
+```
+
+## 1.4 Tablas de contingencia
+
+### 1.4.1 Prueba de independencia
+
+¿El canal se relaciona con el propósito del crédito?
+
+```{r}
+tabla_cp <- table(hipotecas$canal, hipotecas$proposito)
+round(prop.table(tabla_cp, 1), 3)
+chisq.test(tabla_cp)
+```
+
+### 1.4.2 Prueba de proporciones
+
+¿La proporción de compradores primerizos es la misma en los tres canales?
+
+```{r}
+tabla_pc <- table(hipotecas$canal, hipotecas$primer_comprador)
+round(prop.table(tabla_pc, 1)[, "TRUE"], 3)
+prop.test(tabla_pc[, "TRUE"], rowSums(tabla_pc))
+```
+
+Los brókers y corresponsales atienden a más compradores primerizos que el banco directo. Es una primera señal de que **los clientes de cada canal son distintos**, y por eso compararlos sin ajustar puede engañar.
+
+### 1.4.3 Prueba de la mediana
+
+Clasificamos cada crédito según esté arriba o abajo de la mediana general y probamos si esa proporción es igual en los tres canales. Los corresponsales quedan arriba de la mediana un poco más seguido; la diferencia es significativa, pero de unos pocos puntos porcentuales:
+
+```{r}
+med <- median(hipotecas$tasa)
+tabla_med <- table(hipotecas$canal, arriba_de_la_mediana = hipotecas$tasa > med)
+tabla_med
+chisq.test(tabla_med)
+```
+
+## Lo que sabemos al terminar la unidad 1
+
+- **Los datos:** la tasa es discreta (octavos y terminaciones como .99), asimétrica y con muchísimos empates; ninguna prueba de normalidad la acepta. Las pruebas no paramétricas son la herramienta natural para comparar grupos así.
+- **Calidad de datos:** McNemar encuentra unos pocos créditos con más de 80% de LTV sin seguro hipotecario; son pocos, pero vale la pena saberlo antes de modelar.
+- **El FICO importa:** la tasa promedio baja de forma sostenida conforme mejora la calificación (Kruskal y Wallis).
+- **El canal, en crudo, casi no importa:** las comparaciones de localización entre canales dan diferencias de cero o pocos puntos base, aunque algunas resulten significativas por el tamaño de muestra. Lo que sí difiere es la **dispersión** (Fligner) y, sobre todo, **quiénes son los clientes**: el banco directo atiende a menos primerizos y a más refinanciamientos con retiro de efectivo (tablas de contingencia).
+- **El mercado se movió** durante el año, sin tendencia monótona (Cox y Stuart).
+
+Las pruebas no paramétricas comparan grupos de uno en uno. Para saber si los brókers cobran más **a igual FICO, LTV, propósito y mes**, hace falta ajustar por todo a la vez: eso es la regresión de la unidad 2.

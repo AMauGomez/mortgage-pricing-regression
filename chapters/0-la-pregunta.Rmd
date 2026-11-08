@@ -1,0 +1,74 @@
+---
+title: "0. La pregunta: ¿cómo se fija la tasa de una hipoteca?"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+```
+
+## La pregunta
+
+Dos personas piden el mismo crédito para comprar una casa el mismo mes. Una tiene un historial de crédito excelente y la otra uno regular; una llega directo al banco y la otra a través de un **bróker** (un intermediario que compara bancos y cobra por ello). ¿Pagan la misma tasa?
+
+Durante el curso vamos a contestar dos preguntas concretas:
+
+1. **¿Cuánto más paga de tasa un acreditado con peor historial de crédito?**
+2. **¿Los brókers cobran más que el banco directo, a igual riesgo?**
+
+La segunda es una pregunta de política pública: si los intermediarios encarecieran el crédito, convendría evitarlos. Contestarla bien obliga a comparar **personas comparables**, que es justo lo que enseña la regresión.
+
+## Los datos
+
+Freddie Mac, una empresa del gobierno de EE. UU. que compra hipotecas a los bancos, publica las características de cada crédito que adquiere. Usamos su **muestra aleatoria de 50,000 hipotecas otorgadas en 2024**. Por cada crédito sabemos, al momento de otorgarlo:
+
+| Variable | Qué es |
+|---|---|
+| Tasa | Tasa de interés anual del crédito (la variable respuesta) |
+| FICO | Calificación de crédito del acreditado (300 a 850; más alto = mejor historial) |
+| LTV | Préstamo entre valor de la casa, en %. LTV de 80 = puso 20% de enganche |
+| DTI | Pagos de deudas entre ingreso, en % |
+| Canal | Banco directo, bróker o corresponsal (un banco pequeño que otorga el crédito y lo vende) |
+| Propósito | Compra, refinanciamiento o refinanciamiento con retiro de efectivo |
+| Mes | Mes del primer pago (refleja cuándo se pactó la tasa) |
+
+> Los datos no están en el repositorio: los términos de Freddie Mac permiten publicar resultados, no los datos. Para reproducir, descárgalos con un registro gratuito (ver README). Ningún capítulo muestra créditos individuales; solo resúmenes y modelos.
+
+Nos quedamos con hipotecas a **30 años** (las de 15 o 20 años tienen otra tasa) y con un periodo de **12 meses completos**: primer pago entre marzo de 2024 y febrero de 2025.
+
+```{r}
+hipotecas <- leer_hipotecas()
+c(creditos = nrow(hipotecas), tasa_promedio = mean(hipotecas$tasa), tasa_mediana = median(hipotecas$tasa))
+hipotecas |> count(canal) |> mutate(porcentaje = round(100 * n / sum(n), 1))
+```
+
+## Un primer vistazo, y por qué no basta
+
+```{r}
+hipotecas |> group_by(canal) |>
+  summarise(creditos = n(), tasa_promedio = mean(tasa), fico_promedio = mean(fico), ltv_promedio = mean(ltv))
+```
+
+Los brókers cobran, en promedio, prácticamente lo mismo que el banco directo. ¿Respuesta lista? No. Dos cosas pueden engañar a esta comparación:
+
+- **El mercado se mueve.** La tasa depende mucho de *cuándo* se pactó el crédito, porque las tasas del mercado subieron y bajaron durante 2024. Si los brókers otorgaron más créditos en meses caros o baratos, la comparación se contamina.
+- **Los acreditados no son iguales.** Si los clientes de bróker son más riesgosos (por ejemplo, con menos enganche), a igual tasa estarían pagando *menos* por su riesgo.
+
+```{r, fig.height = 3.8}
+hipotecas |> group_by(mes) |> summarise(tasa = median(tasa)) |>
+  ggplot(aes(as.Date(paste0(mes, "01"), "%Y%m%d"), tasa)) +
+  geom_line(colour = AZUL) + geom_point(colour = AZUL) +
+  labs(x = "Mes del primer pago", y = "Tasa mediana (%)", title = "La tasa del mercado cambió casi un punto en un año")
+```
+
+## El plan del curso
+
+| Capítulo | Unidad del temario (clave 1639) | Qué aporta a la respuesta |
+|---|---|---|
+| 1 | 1. Pruebas no paramétricas | Comparar grupos sin suponer normalidad; revisar la calidad de los datos |
+| 2 | 2.1–2.2 Regresión lineal simple | Cuánto cambia la tasa con el FICO, y si la relación es lineal |
+| 3 | 2.3–2.4 Regresión múltiple y selección de modelos | Ajustar por todo lo demás a la vez |
+| 4 | 2.5–2.6 ANOVA y ANCOVA | La respuesta: ¿los brókers cobran más, a igual riesgo? |
+| 5 | Más allá del curso: MANOVA y MANCOVA | ¿Qué tipo de crédito otorga cada canal, considerando tasa, enganche, DTI y monto a la vez? |

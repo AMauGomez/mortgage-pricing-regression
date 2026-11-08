@@ -1,0 +1,185 @@
+---
+title: "4. Análisis de varianza y de covarianza"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+```
+
+*Temario: unidades 2.5 y 2.6 (Modelos No Paramétricos y de Regresión, clave 1639).*
+
+La segunda pregunta del curso: **¿los brókers cobran más que el banco directo, a igual riesgo?** El canal es una variable categórica con tres niveles: banco directo, bróker y corresponsal. Comparar las medias de una respuesta entre grupos es un **análisis de varianza** (ANOVA). Compararlas *ajustando* por otras variables es un **análisis de covarianza** (ANCOVA).
+
+```{r}
+hipotecas <- leer_hipotecas() |>
+  mutate(banda_fico = relevel(banda_fico(fico), "780+"), banda_ltv = relevel(banda_ltv(ltv), "75–80"),
+         varios_acreditados = acreditados > 1, varias_unidades = unidades > 1)
+hipotecas |> group_by(canal) |> summarise(creditos = n(), tasa_promedio = mean(tasa), desviacion_estandar = sd(tasa))
+```
+
+## 2.5 Análisis de varianza (ANOVA)
+
+### ANOVA de un factor
+
+$$
+Y_{ij} = \mu + \tau_i + \varepsilon_{ij}, \qquad H_0: \tau_1 = \tau_2 = \tau_3 .
+$$
+
+Es una regresión con variables indicadoras: la misma descomposición $SCT = SC_{\text{entre}} + SC_{\text{dentro}}$ del capítulo 2, ahora entre y dentro de grupos.
+
+```{r}
+un_factor <- aov(tasa ~ canal, data = hipotecas)
+summary(un_factor)
+```
+
+**Supuestos.** El ANOVA supone errores independientes, normales y con **varianza igual en los grupos**. En el capítulo 1, la prueba de Fligner y Killeen ya rechazó varianzas iguales; la de Levene (basada en desviaciones respecto a la mediana) coincide:
+
+```{r}
+car::leveneTest(tasa ~ canal, data = hipotecas)
+```
+
+Cuando las varianzas difieren, el ANOVA de **Welch** no las supone iguales:
+
+```{r}
+oneway.test(tasa ~ canal, data = hipotecas, var.equal = FALSE)
+```
+
+La normalidad de los errores importa poco con miles de datos por grupo (teorema del límite central); la igualdad de varianzas sí, porque los grupos tienen tamaños distintos.
+
+**Comparaciones múltiples.** Si se rechaza $H_0$, ¿qué pares difieren? La prueba de Tukey controla la probabilidad de cometer *algún* error tipo I entre todas las comparaciones:
+
+```{r}
+tukey <- TukeyHSD(un_factor)$canal
+round(cbind(diferencia_pb = 100 * tukey[, "diff"], ic_inf = 100 * tukey[, "lwr"], ic_sup = 100 * tukey[, "upr"], p_ajustado = tukey[, "p adj"]), 3)
+```
+
+### ANOVA de dos factores: canal y mes
+
+¿La diferencia entre canales es la misma todos los meses? Si no, hay **interacción**:
+
+```{r}
+dos_factores <- lm(tasa ~ canal * mes, data = hipotecas)
+anova(lm(tasa ~ canal + mes, data = hipotecas), dos_factores)
+```
+
+Tres lecciones de esta sección:
+
+- **El ANOVA global y las comparaciones por pares contestan cosas distintas.** La prueba $F$ rechaza (al 5%) que los tres canales tengan la misma media, pero ninguna comparación de Tukey es significativa: la prueba global puede detectar una diferencia que no alcanza a atribuirse a un par concreto con la protección por comparaciones múltiples.
+- **Las diferencias son de uno o dos puntos base** y, sin ajustar por nada, los intermediarios aparecen incluso un poco *más baratos*.
+- **La interacción canal × mes es significativa:** la brecha entre canales cambia de un mes a otro. Esto ya anticipa que una comparación que ignore el mes puede salir distinta de una que lo controle.
+
+## 2.6 Análisis de covarianza (ANCOVA)
+
+### El modelo
+
+El ANCOVA agrega al ANOVA variables explicativas continuas o de control, las **covariables**, para comparar los grupos **como si tuvieran las mismas características**:
+
+$$
+Y = \mu + \tau_{\text{canal}} + \underbrace{\gamma_{\text{mes}} + \text{FICO} + \text{LTV} + \text{DTI} + \dots}_{\text{covariables}} + \varepsilon .
+$$
+
+Las covariables son las del modelo base del capítulo 3. Así, $\tau_{\text{bróker}} - \tau_{\text{banco directo}}$ compara dos créditos pactados el mismo mes, con el mismo FICO, enganche, propósito y ocupación.
+
+```{r}
+ancova <- lm(tasa ~ canal + mes + banda_fico + banda_ltv + dti + log(monto) + proposito + ocupacion +
+               varios_acreditados + varias_unidades, data = hipotecas)
+car::Anova(ancova, type = 2)["canal", ]
+```
+
+La prueba de **tipo II** evalúa el canal después de todas las demás variables, sin depender del orden en que se escribieron (a diferencia de la tabla secuencial del capítulo 3).
+
+### El supuesto clave: pendientes homogéneas
+
+El ANCOVA supone que el efecto de las covariables es **el mismo en los tres canales**: por ejemplo, que un FICO más alto baja la tasa igual en un bróker que en el banco directo. Si no, la diferencia entre canales dependería del FICO y "el efecto del canal" no sería un solo número. Lo probamos con interacciones:
+
+```{r}
+con_interaccion_fico <- update(ancova, . ~ . + canal:banda_fico)
+con_interaccion_mes <- update(ancova, . ~ . + canal:mes)
+rbind(canal_por_fico = anova(ancova, con_interaccion_fico)[2, c("Df", "F", "Pr(>F)")],
+      canal_por_mes = anova(ancova, con_interaccion_mes)[2, c("Df", "F", "Pr(>F)")])
+```
+
+Las dos interacciones son estadísticamente significativas: con 46,000 créditos, incluso diferencias pequeñas entre pendientes se detectan. La pregunta útil es **de qué tamaño son**. Estimamos la brecha bróker − banco directo dentro de cada banda de FICO (un modelo por banda, con las demás covariables):
+
+```{r}
+f_sin_fico <- update(formula(ancova), . ~ . - banda_fico)
+por_banda <- do.call(rbind, lapply(levels(hipotecas$banda_fico), function(b) {
+  m <- lm(f_sin_fico, data = filter(hipotecas, banda_fico == b))
+  data.frame(banda = b, creditos = sum(hipotecas$banda_fico == b),
+             broker_pb = 100 * coef(m)[["canalBróker"]], ee_pb = 100 * coef(summary(m))["canalBróker", "Std. Error"],
+             corresponsal_pb = 100 * coef(m)[["canalCorresponsal"]])
+}))
+por_banda$banda <- factor(por_banda$banda, c("<640", "640–659", "660–679", "680–699", "700–719", "720–739", "740–759", "760–779", "780+"))
+knitr::kable(por_banda[order(por_banda$banda), ], digits = 1, row.names = FALSE)
+```
+
+Hay un patrón: con los acreditados de **FICO alto** (740 o más, la mayoría de la muestra), los brókers son ligeramente *más baratos* que el banco directo; en el **rango medio** (660 a 739), algo *más caros*, de unos 2 a 7 puntos base. Una lectura posible es que los brókers compiten más por los mejores clientes; los datos no permiten confirmarla. Dos cautelas: son nueve comparaciones (alguna puede salir grande por azar), y en las bandas bajas hay pocos créditos de bróker, por eso sus errores estándar son grandes.
+
+La consecuencia para el ANCOVA: **el efecto promedio del canal es un resumen razonable, pero no es el mismo para todos los acreditados**. Lo reportamos como promedio y dejamos dicho que varía unos pocos puntos base según el FICO.
+
+### Medias ajustadas
+
+Las **medias ajustadas** (o medias marginales estimadas) son la tasa promedio que tendría cada canal si sus clientes tuvieran la distribución de características de toda la muestra. Después comparamos cada intermediario contra el banco directo; como son dos comparaciones, los intervalos y valores p se ajustan por **Dunnett**, la versión de Tukey para comparar varios grupos contra un control:
+
+```{r}
+medias <- emmeans::emmeans(ancova, "canal", nuisance = c("mes", "banda_fico", "banda_ltv", "proposito", "ocupacion",
+                                                          "varios_acreditados", "varias_unidades"), weights = "proportional")
+medias
+contrastes <- emmeans::contrast(medias, "trt.vs.ctrl", ref = 1)
+resumen <- summary(contrastes, infer = TRUE)
+data.frame(comparacion = resumen$contrast, diferencia_pb = round(100 * resumen$estimate, 1),
+           ic_inf = round(100 * resumen$lower.CL, 1), ic_sup = round(100 * resumen$upper.CL, 1), p = signif(resumen$p.value, 2))
+```
+
+```{r, fig.height = 3.6}
+crudas <- hipotecas |> group_by(canal) |> summarise(diferencia = mean(tasa)) |>
+  mutate(diferencia = 100 * (diferencia - diferencia[canal == "Banco directo"]), tipo = "sin ajustar")
+ajustadas <- data.frame(canal = c("Banco directo", "Bróker", "Corresponsal"),
+                        diferencia = c(0, 100 * resumen$estimate), inf = c(0, 100 * resumen$lower.CL),
+                        sup = c(0, 100 * resumen$upper.CL), tipo = "ajustada (ANCOVA)")
+bind_rows(crudas, ajustadas) |> filter(canal != "Banco directo") |>
+  ggplot(aes(diferencia, canal, colour = tipo)) + geom_vline(xintercept = 0, colour = GRIS) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(aes(xmin = inf, xmax = sup), height = 0, position = position_dodge(width = 0.4)) +
+  scale_colour_manual(values = c("sin ajustar" = GRIS, "ajustada (ANCOVA)" = AZUL)) +
+  labs(x = "Puntos base de tasa contra el banco directo", y = NULL, colour = NULL,
+       title = "¿Cobran más los intermediarios?") + theme(legend.position = "top")
+```
+
+### ¿Es robusta la respuesta?
+
+Tres verificaciones:
+
+```{r}
+# 1. Errores estándar robustos a varianza no constante (HC3)
+rob <- lmtest::coeftest(ancova, vcov. = sandwich::vcovHC(ancova, type = "HC3"))[c("canalBróker", "canalCorresponsal"), ]
+# 2. Agregando las variables que eligió la selección por AIC del capítulo 3
+ampliado <- update(ancova, . ~ . + primer_comprador + cltv)
+# 3. Solo compras de vivienda propia (el segmento más homogéneo)
+homogeneo <- update(ancova, . ~ . - proposito - ocupacion,
+                    data = filter(hipotecas, proposito == "Compra", ocupacion == "Vivienda propia"))
+pb <- function(m) round(100 * coef(m)[c("canalBróker", "canalCorresponsal")], 1)
+rbind(ancova = pb(ancova), ee_robusto = round(100 * rob[, "Std. Error"], 1),
+      con_primerizo_y_cltv = pb(ampliado), solo_compras_vivienda_propia = pb(homogeneo))
+```
+
+## La respuesta
+
+**¿Los brókers cobran más que el banco directo, a igual riesgo? No, en promedio.**
+
+- Comparando créditos pactados el mismo mes, con el mismo FICO, enganche, propósito y ocupación, la tasa de bróker difiere de la del banco directo en `r round(100 * resumen$estimate[1], 1)` puntos base (IC 95%: `r round(100 * resumen$lower.CL[1], 1)` a `r round(100 * resumen$upper.CL[1], 1)`). El intervalo descarta que los brókers cobren, en promedio, más de `r round(100 * resumen$upper.CL[1], 1)` puntos base adicionales: en un crédito de 300,000 dólares, menos de `r round(costo_pb(100 * resumen$upper.CL[1])[["por_mes"]], 0)` dólares al mes.
+- Los **corresponsales** sí cobran algo más: `r round(100 * resumen$estimate[2], 1)` puntos base (IC 95%: `r round(100 * resumen$lower.CL[2], 1)` a `r round(100 * resumen$upper.CL[2], 1)`), unos `r round(costo_pb(100 * resumen$estimate[2])[["por_mes"]], 0)` dólares al mes. Es **estadísticamente claro y económicamente pequeño**.
+- **Para los corresponsales, el signo se invierte al ajustar:** en crudo parecían más baratos que el banco directo; a igual riesgo, son más caros. La razón está en los capítulos anteriores: el banco directo atiende el doble de refinanciamientos con retiro de efectivo (capítulo 1), y esos créditos pagan unos 29 puntos base más (capítulo 3). La comparación cruda estaba mezclando el canal con el tipo de crédito. Es el argumento central de este curso: **comparar grupos sin ajustar puede dar la respuesta al revés**.
+- El resultado se sostiene con errores robustos, con más variables de control y en el segmento más homogéneo (compras de vivienda propia).
+- La brecha **no es igual para todos**: unos pocos puntos base a favor del bróker en FICO altos y en contra en FICO medios.
+
+Y la comparación con la primera pregunta pone las cosas en escala: tener un FICO de 660–679 en lugar de 780 cuesta unos 23 puntos base (capítulo 3); elegir canal cuesta, en promedio, a lo más dos o tres, y unos siete en el peor segmento de FICO. **Para el acreditado, su historial de crédito y el momento en que pacta la tasa importan mucho más que con quién la pacta.**
+
+## Lo que los datos no dicen
+
+- **La tasa no es todo el costo.** Freddie Mac registra la tasa, pero no las **comisiones** ni los **puntos** (pagos al inicio para bajar la tasa). Los brókers suelen cobrar una comisión; si la cobran aparte, un bróker puede ofrecer la misma tasa y aun así costar más. La pregunta correcta sería "¿a igual **costo total**?", y estos datos no permiten contestarla.
+- **Quién usa cada canal no es aleatorio.** El ANCOVA iguala las características observadas, no las que no están en los datos (por ejemplo, qué tanto compara precios cada acreditado). La diferencia ajustada es una **asociación**, no un efecto causal del canal.
+- **Solo hipotecas que compró Freddie Mac:** créditos que cumplen sus reglas (conformes). Los créditos fuera de esas reglas pueden comportarse distinto.

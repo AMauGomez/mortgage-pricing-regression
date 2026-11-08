@@ -1,0 +1,223 @@
+---
+title: "5. Más allá del curso: MANOVA y MANCOVA"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+```
+
+*Este capítulo va más allá del temario de Regresión: el análisis de varianza multivariado se estudia en Análisis Multivariado (clave 1815).*
+
+En el capítulo 4 comparamos los canales en **una** variable, la tasa. Pero un crédito es un paquete: tasa, cuánto enganche se pone (LTV), qué tan apretado queda el acreditado (DTI) y cuánto se presta. La pregunta de este capítulo:
+
+> **¿Los tres canales otorgan créditos distintos, considerando el paquete completo?**
+
+```{r}
+hipotecas <- leer_hipotecas() |> mutate(log_monto = log(monto))
+respuestas <- c("tasa", "ltv", "dti", "log_monto")
+Y <- as.matrix(hipotecas[, respuestas])
+hipotecas |> group_by(canal) |> summarise(across(all_of(respuestas), mean), creditos = n())
+round(cor(Y), 2)
+```
+
+## ¿Por qué no hacer cuatro ANOVAs?
+
+1. **Error tipo I acumulado.** Con cuatro pruebas al 5%, la probabilidad de al menos un falso positivo, si las respuestas fueran independientes, es $1 - 0.95^4 \approx$ `r round(1 - 0.95^4, 2)`.
+2. **Las respuestas están correlacionadas** (LTV y monto, por ejemplo), y cuatro ANOVAs separados ignoran esa información.
+3. **Los grupos pueden diferir en una combinación** de variables aunque ninguna variable por sí sola muestre mucha diferencia.
+
+El análisis de varianza multivariado (MANOVA) prueba todas las respuestas a la vez.
+
+## MANOVA de un factor
+
+### El modelo
+
+$$
+\mathbf{Y}_{ij} = \boldsymbol\mu + \boldsymbol\tau_i + \boldsymbol\varepsilon_{ij}, \qquad \boldsymbol\varepsilon_{ij} \sim N_p(\mathbf{0}, \boldsymbol\Sigma), \qquad H_0: \boldsymbol\tau_1 = \boldsymbol\tau_2 = \boldsymbol\tau_3 = \mathbf{0},
+$$
+
+con $\mathbf{Y}_{ij}$ el vector de $p = 4$ respuestas del crédito $j$ en el canal $i$. La descomposición del ANOVA se vuelve una descomposición de **matrices** de sumas de cuadrados y productos cruzados:
+
+$$
+\mathbf{T} = \mathbf{H} + \mathbf{E}, \qquad
+\mathbf{H} = \sum_i n_i (\bar{\mathbf{y}}_i - \bar{\mathbf{y}})(\bar{\mathbf{y}}_i - \bar{\mathbf{y}})^\top, \qquad
+\mathbf{E} = \sum_i \sum_j (\mathbf{y}_{ij} - \bar{\mathbf{y}}_i)(\mathbf{y}_{ij} - \bar{\mathbf{y}}_i)^\top .
+$$
+
+$\mathbf{H}$ es la variación **entre** canales y $\mathbf{E}$ la variación **dentro** de cada canal.
+
+### Las cuatro estadísticas, a mano
+
+Todas dependen de los valores propios $\lambda_k$ de $\mathbf{E}^{-1}\mathbf{H}$:
+
+| Estadística | Fórmula |
+|---|---|
+| Lambda de Wilks | $\Lambda = \prod_k \frac{1}{1 + \lambda_k} = \frac{|\mathbf{E}|}{|\mathbf{H} + \mathbf{E}|}$ |
+| Traza de Pillai | $V = \sum_k \frac{\lambda_k}{1 + \lambda_k}$ |
+| Traza de Hotelling-Lawley | $U = \sum_k \lambda_k$ |
+| Raíz mayor de Roy | $\theta = \lambda_{\max}$ |
+
+```{r}
+g <- hipotecas$canal
+media_total <- colMeans(Y)
+H <- Reduce(`+`, lapply(levels(g), function(k) {
+  d <- colMeans(Y[g == k, ]) - media_total
+  sum(g == k) * tcrossprod(d)
+}))
+E <- Reduce(`+`, lapply(levels(g), function(k) {
+  Z <- scale(Y[g == k, ], scale = FALSE)
+  crossprod(Z)
+}))
+lambda <- Re(eigen(solve(E) %*% H)$values)
+lambda <- lambda[lambda > 1e-12]
+a_mano <- c(Wilks = prod(1 / (1 + lambda)), Pillai = sum(lambda / (1 + lambda)),
+            Hotelling_Lawley = sum(lambda), Roy = max(lambda))
+manova_1 <- manova(Y ~ canal, data = hipotecas)
+con_R <- sapply(c("Wilks", "Pillai", "Hotelling-Lawley", "Roy"),
+                function(s) summary(manova_1, test = s)$stats["canal", 2])
+rbind(a_mano = a_mano, manova = con_R)
+summary(manova_1, test = "Pillai")
+```
+
+Con 3 grupos hay a lo más $\min(p, k - 1) = 2$ valores propios distintos de cero: los canales solo pueden diferir en dos "direcciones" del espacio de las cuatro respuestas.
+
+**¿Cuál estadística usar?** La traza de **Pillai** es la más robusta cuando los supuestos fallan (en especial la igualdad de matrices de covarianza), por eso es la que reportamos. La de Roy es la más potente si los grupos difieren en una sola dirección, pero la más sensible a violaciones.
+
+**Tamaño del efecto.** Con $s = \min(p, k-1)$, una medida de efecto es $\eta^2 = V / s$:
+
+```{r}
+s <- min(length(respuestas), nlevels(g) - 1)
+c(eta2_multivariado = a_mano[["Pillai"]] / s)
+```
+
+Las cuatro estadísticas calculadas a mano coinciden con las de `manova()`. Se rechaza con mucha claridad que los tres canales otorguen el mismo paquete de crédito, pero el **tamaño del efecto es pequeño**: el canal explica alrededor de `r round(100 * a_mano[["Pillai"]] / s, 1)`% de la variación multivariada. Otra vez, con 46,000 créditos la significancia no dice mucho por sí sola.
+
+### Supuestos
+
+**Normalidad multivariada.** Si $\mathbf{Y} \sim N_p$, las distancias de Mahalanobis al cuadrado de cada crédito a la media de su grupo siguen aproximadamente una $\chi^2_p$. Comparamos sus cuantiles (gráfica de cuantiles, que resume y no muestra créditos):
+
+```{r, fig.height = 3.8}
+residuos <- Y - apply(Y, 2, function(col) ave(col, g))
+S <- E / (nrow(Y) - nlevels(g))
+d2 <- mahalanobis(residuos, rep(0, ncol(Y)), S)
+q <- data.frame(teorico = qchisq(ppoints(200), df = ncol(Y)), observado = quantile(d2, ppoints(200)))
+ggplot(q, aes(teorico, observado)) + geom_abline(colour = GRIS) + geom_point(colour = AZUL) +
+  labs(x = "Cuantiles de una ji cuadrada con 4 g.l.", y = "Cuantiles de las distancias de Mahalanobis",
+       title = "Normalidad multivariada: 200 cuantiles")
+```
+
+**Igualdad de matrices de covarianza: la prueba M de Box.** Compara el determinante de la covarianza de cada grupo con el de la covarianza combinada:
+
+$$
+M = (N - k)\log|\mathbf{S}_p| - \sum_i (n_i - 1)\log|\mathbf{S}_i|,
+$$
+
+que, con una corrección de escala, se aproxima a una $\chi^2$ con $p(p+1)(k-1)/2$ grados de libertad.
+
+```{r}
+box_m <- function(Y, g) {
+  k <- nlevels(g); p <- ncol(Y); N <- nrow(Y); n <- table(g)
+  S_i <- lapply(levels(g), function(l) cov(Y[g == l, ]))
+  S_p <- Reduce(`+`, Map(function(S, m) (m - 1) * S, S_i, n)) / (N - k)
+  M <- (N - k) * log(det(S_p)) - sum(mapply(function(S, m) (m - 1) * log(det(S)), S_i, n))
+  c1 <- (sum(1 / (n - 1)) - 1 / (N - k)) * (2 * p^2 + 3 * p - 1) / (6 * (p + 1) * (k - 1))
+  gl <- p * (p + 1) * (k - 1) / 2
+  c(M = M, ji2 = M * (1 - c1), gl = gl, p = pchisq(M * (1 - c1), gl, lower.tail = FALSE))
+}
+box_m(Y, g)
+```
+
+Los dos supuestos fallan, como era de esperar con estos datos:
+
+- **Normalidad multivariada:** los cuantiles siguen la recta en el centro, pero en la cola superior quedan arriba: hay más créditos "extremos" en la combinación de variables de los que predice la normal. Con decenas de miles de créditos por grupo, el teorema del límite central multivariado protege la inferencia sobre las medias.
+- **Igualdad de covarianzas:** la prueba M de Box rechaza con fuerza. Hay que leerla con cuidado: es muy sensible a la falta de normalidad y, con muestras grandes, rechaza por diferencias mínimas. Aun así, es la razón para reportar la traza de **Pillai**, la estadística más robusta a esta violación cuando los grupos tienen tamaños distintos.
+
+### ¿En qué difieren? Seguimiento
+
+Dos formas de abrir el resultado:
+
+**ANOVAs univariados con corrección de Bonferroni** (cada uno al nivel $0.05/4$):
+
+```{r}
+univariados <- sapply(respuestas, function(v) {
+  a <- anova(lm(hipotecas[[v]] ~ g))
+  c(F = a$`F value`[1], p = a$`Pr(>F)`[1], p_bonferroni = min(1, 4 * a$`Pr(>F)`[1]),
+    eta2 = a$`Sum Sq`[1] / sum(a$`Sum Sq`))
+})
+round(t(univariados), 5)
+```
+
+**Análisis discriminante canónico.** Busca las combinaciones lineales de las respuestas que **más separan** a los canales. Son los vectores propios de $\mathbf{E}^{-1}\mathbf{H}$; la correlación de cada respuesta con la primera función ("cargas estructurales") dice qué variables definen la diferencia:
+
+```{r}
+ad <- MASS::lda(canal ~ tasa + ltv + dti + log_monto, data = hipotecas)
+proporcion <- ad$svd^2 / sum(ad$svd^2)
+puntajes <- predict(ad)$x
+estructura <- cor(Y, puntajes)
+list(proporcion_de_la_separacion = round(proporcion, 3), cargas_estructurales = round(estructura, 2))
+data.frame(puntajes, canal = g) |> group_by(canal) |> summarise(across(starts_with("LD"), mean))
+```
+
+Las dos herramientas cuentan la misma historia:
+
+- **La tasa no distingue a los canales:** su ANOVA ni siquiera es significativo después de Bonferroni, y su carga en la función discriminante es casi cero. Coincide con el capítulo 4.
+- **Lo que distingue a los canales es el tamaño del crédito y el enganche.** La primera función discriminante concentra `r round(100 * proporcion[1])`% de la separación y es, sobre todo, el **monto** (carga cercana a −1) junto con el **LTV**. El banco directo queda en un extremo (créditos más chicos y con más enganche) y los brókers en el otro.
+
+En palabras: los intermediarios no cobran distinto, pero **atienden créditos distintos**, más grandes y con menos enganche.
+
+## MANCOVA: ¿siguen siendo distintos a igual FICO y mes?
+
+Parte de la diferencia puede venir de que cada canal atiende a acreditados con distinto FICO o en distintos meses. La **MANCOVA** agrega covariables, igual que el ANCOVA del capítulo 4 lo hizo con una sola respuesta:
+
+$$
+\mathbf{Y} = \boldsymbol\mu + \boldsymbol\tau_{\text{canal}} + \mathbf{B}^\top \mathbf{x} + \boldsymbol\varepsilon, \qquad \mathbf{x} = (\text{FICO}, \text{mes}).
+$$
+
+```{r}
+mancova <- lm(cbind(tasa, ltv, dti, log_monto) ~ canal + fico + mes, data = hipotecas)
+car::Manova(mancova, type = 2, test.statistic = "Pillai")
+```
+
+La prueba de **tipo II** evalúa el canal después de las covariables.
+
+**Pendientes homogéneas.** Igual que en el ANCOVA, el efecto de las covariables debería ser el mismo en todos los canales:
+
+```{r}
+con_interaccion <- lm(cbind(tasa, ltv, dti, log_monto) ~ canal * fico + mes, data = hipotecas)
+car::Manova(con_interaccion, type = 2, test.statistic = "Pillai")
+```
+
+**Seguimiento: diferencias ajustadas por respuesta.** Cuánto difiere cada canal del banco directo en cada variable, a igual FICO y mes:
+
+```{r}
+ajustadas <- sapply(respuestas, function(v) {
+  m <- lm(reformulate(c("canal", "fico", "mes"), v), data = hipotecas)
+  ic <- confint(m)
+  c(broker = coef(m)[["canalBróker"]], broker_inf = ic["canalBróker", 1], broker_sup = ic["canalBróker", 2],
+    corresponsal = coef(m)[["canalCorresponsal"]], corresp_inf = ic["canalCorresponsal", 1], corresp_sup = ic["canalCorresponsal", 2])
+})
+round(t(ajustadas), 3)
+```
+
+(La tasa en puntos porcentuales; el LTV y el DTI en puntos; el monto en logaritmo, de modo que una diferencia $d$ equivale a $100(e^{d} - 1)$% más monto.)
+
+```{r}
+round(100 * (exp(ajustadas[c("broker", "corresponsal"), "log_monto"]) - 1), 1)
+```
+
+Lo que dice la MANCOVA:
+
+- **A igual FICO y mes, los canales siguen difiriendo** como paquete (Pillai prácticamente igual que sin covariables): las diferencias no se explican por el historial de los acreditados ni por el momento del mercado.
+- Los créditos de bróker son, en promedio, unos `r round(100 * (exp(ajustadas["broker", "log_monto"]) - 1))`% **más grandes**, con unos `r round(ajustadas["broker", "ltv"], 1)` puntos más de LTV y `r round(ajustadas["broker", "dti"], 1)` más de DTI; los de corresponsal van en la misma dirección, algo menos. **En tasa, ninguno difiere** del banco directo.
+- La interacción canal × FICO es significativa, pero su Pillai es diminuto: las pendientes son prácticamente homogéneas.
+
+Una nota para no confundirse con el capítulo 4: aquí la tasa del corresponsal no difiere del banco directo, y allá salió 1.9 puntos base más alta. No es contradicción: en el capítulo 4 la tasa se ajustó también por LTV, propósito y ocupación, que aquí no pueden ser covariables porque el LTV es una de las respuestas. **Qué se ajusta cambia lo que se compara.**
+
+## Lo que agrega este capítulo
+
+- **ANOVA, ANCOVA, MANOVA y MANCOVA son el mismo modelo lineal** con una o varias respuestas y con o sin covariables. Las estadísticas multivariadas (Wilks, Pillai, Hotelling-Lawley, Roy) son funciones de los valores propios de $\mathbf{E}^{-1}\mathbf{H}$, que es el cociente "entre / dentro" del ANOVA llevado a matrices.
+- **El análisis multivariado contesta una pregunta distinta:** no "¿cobran más?", sino "¿qué tipo de crédito otorga cada canal?". Y la respuesta completa el cuadro: los intermediarios no encarecen la tasa, pero atienden créditos más grandes y con menos enganche.
+- **El seguimiento importa tanto como la prueba global:** un MANOVA significativo no dice *en qué* difieren los grupos; los ANOVAs con Bonferroni y el análisis discriminante sí.

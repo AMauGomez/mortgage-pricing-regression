@@ -1,0 +1,283 @@
+---
+title: "3. Regresión lineal múltiple y selección de modelos"
+subtitle: "Modelos No Paramétricos y de Regresión · Caso de estudio: tasas hipotecarias en EE. UU., 2024"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.5)
+source("funciones-caso.R")
+set.seed(2026)
+```
+
+*Temario: unidades 2.3 y 2.4 (Modelos No Paramétricos y de Regresión, clave 1639).*
+
+En el capítulo 2 usamos un solo mes para que el mercado no se mezclara con el FICO. La regresión múltiple permite usar **todo el año** y **ajustar por todo a la vez**: el efecto de cada variable se estima *con las demás fijas*. Este capítulo contesta la primera pregunta del curso: **¿cuánto más paga de tasa un acreditado con peor historial, comparado con uno igual en todo lo demás?**
+
+```{r}
+hipotecas <- leer_hipotecas() |>
+  mutate(banda_fico = relevel(banda_fico(fico), "780+"),
+         banda_ltv = relevel(banda_ltv(ltv), "75–80"),
+         varios_acreditados = acreditados > 1,
+         varias_unidades = unidades > 1)
+nrow(hipotecas)
+```
+
+## 2.3 El modelo de regresión lineal múltiple
+
+### 2.3.1 El modelo en términos matriciales
+
+$$
+\mathbf{Y} = \mathbf{X}\boldsymbol\beta + \boldsymbol\varepsilon, \qquad E[\boldsymbol\varepsilon] = \mathbf{0}, \quad \operatorname{Var}(\boldsymbol\varepsilon) = \sigma^2 \mathbf{I},
+$$
+
+donde cada renglón de $\mathbf{X}$ describe un crédito. Las variables:
+
+- **Mes** (12 niveles): captura el mercado. Con él, cada coeficiente compara créditos pactados en el mismo mes.
+- **Banda de FICO** (referencia: 780 o más) y **banda de LTV** (referencia: 75–80), como en las tablas de precio de la industria.
+- DTI, logaritmo del monto, propósito, ocupación, si hay más de un acreditado y si la vivienda tiene más de una unidad.
+
+El seguro hipotecario se deja fuera a propósito; la razón está en 2.3.12.
+
+```{r}
+formula_base <- tasa ~ mes + banda_fico + banda_ltv + dti + log(monto) + proposito + ocupacion +
+  varios_acreditados + varias_unidades
+X <- model.matrix(formula_base, hipotecas)
+dim(X)
+```
+
+### 2.3.2 Estimación por mínimos cuadrados
+
+$\hat{\boldsymbol\beta} = (\mathbf{X}^\top\mathbf{X})^{-1}\mathbf{X}^\top\mathbf{Y}$. En la práctica no se invierte la matriz (es numéricamente inestable); se usa la descomposición QR, como hace `lm()`:
+
+```{r}
+modelo <- lm(formula_base, data = hipotecas)
+beta_qr <- qr.coef(qr(X), hipotecas$tasa)
+max(abs(beta_qr - coef(modelo)))
+```
+
+### 2.3.3 Valores ajustados y residuales
+
+$\hat{\mathbf{Y}} = \mathbf{H}\mathbf{Y}$ con $\mathbf{H} = \mathbf{X}(\mathbf{X}^\top\mathbf{X})^{-1}\mathbf{X}^\top$, la matriz "sombrero". Su diagonal $h_{ii}$ (el **apalancamiento**) mide qué tan inusual es cada crédito en sus variables explicativas; su promedio es $p/n$:
+
+```{r}
+h <- hatvalues(modelo)
+c(promedio_h = mean(h), p_entre_n = ncol(X) / nrow(X), maximo_h = max(h),
+  creditos_con_h_mayor_a_3p_n = sum(h > 3 * ncol(X) / nrow(X)))
+```
+
+### 2.3.4 Resultados del análisis de varianza
+
+```{r}
+anova(modelo)
+c(R2 = summary(modelo)$r.squared, R2_ajustada = summary(modelo)$adj.r.squared)
+```
+
+La tabla es **secuencial**: cada renglón mide lo que agrega esa variable *después* de las anteriores. Por eso el orden importa, y para medir la contribución propia de cada variable usamos las pruebas de 2.3.9 y los coeficientes de determinación parcial de 2.3.11.
+
+### 2.3.5 Inferencias acerca de los parámetros
+
+```{r}
+coeficientes <- broom::tidy(modelo, conf.int = TRUE) |>
+  filter(grepl("banda|proposito|ocupacion|seguro|varios|varias|dti|monto", term)) |>
+  transmute(variable = term, efecto_pb = 100 * estimate, ic_inferior = 100 * conf.low, ic_superior = 100 * conf.high, p = p.value)
+knitr::kable(coeficientes, digits = c(0, 1, 1, 1, 4))
+```
+
+En puntos base, comparando contra la categoría de referencia **con todo lo demás igual** (mismo mes, mismo LTV, mismo propósito…):
+
+```{r, fig.height = 3.8}
+coeficientes |> filter(grepl("banda_fico", variable)) |>
+  mutate(banda = factor(sub("banda_fico", "", variable), levels(hipotecas$banda_fico)[-1])) |>
+  ggplot(aes(banda, efecto_pb)) + geom_hline(yintercept = 0, colour = GRIS) +
+  geom_pointrange(aes(ymin = ic_inferior, ymax = ic_superior), colour = AZUL) +
+  labs(x = "Banda de FICO", y = "Puntos base más que un FICO de 780+",
+       title = "Cuánto más paga cada banda de FICO, a igualdad de todo lo demás")
+```
+
+### 2.3.6 Inferencias acerca de la respuesta media
+### 2.3.7 Predicción de nuevas observaciones
+
+Dos acreditados idénticos (compra de vivienda propia en diciembre de 2024, LTV de 75–80, DTI de 40, un crédito de 300,000 dólares, un acreditado), que solo difieren en su FICO:
+
+```{r}
+perfil <- data.frame(mes = factor("202412", levels(hipotecas$mes)),
+                     banda_fico = factor(c("780+", "660–679"), levels(hipotecas$banda_fico)),
+                     banda_ltv = factor("75–80", levels(hipotecas$banda_ltv)), dti = 40, monto = 300000,
+                     proposito = factor("Compra", levels(hipotecas$proposito)),
+                     ocupacion = factor("Vivienda propia", levels(hipotecas$ocupacion)),
+                     varios_acreditados = FALSE, varias_unidades = FALSE)
+media <- predict(modelo, perfil, interval = "confidence"); pred <- predict(modelo, perfil, interval = "prediction")
+data.frame(fico = perfil$banda_fico, tasa_media = media[, "fit"], ic_media_inf = media[, "lwr"], ic_media_sup = media[, "upr"],
+           pred_inf = pred[, "lwr"], pred_sup = pred[, "upr"])
+```
+
+### 2.3.8 Gráficas de residuales y otros diagnósticos
+
+```{r, fig.height = 3.8}
+hipotecas$residual <- residuals(modelo); hipotecas$ajustado <- fitted(modelo)
+hipotecas |> mutate(grupo = cut(ajustado, unique(quantile(ajustado, 0:25 / 25)), include.lowest = TRUE)) |>
+  group_by(grupo) |> summarise(ee = sd(residual) / sqrt(n()), ajustado = mean(ajustado), residual = mean(residual)) |>
+  ggplot(aes(ajustado, residual)) + geom_hline(yintercept = 0, linetype = 2, colour = GRIS) +
+  geom_pointrange(aes(ymin = residual - 2 * ee, ymax = residual + 2 * ee), colour = AZUL) +
+  labs(x = "Valor ajustado (grupos de igual tamaño)", y = "Residual promedio ± 2 e.e.", title = "Residuales contra ajustados")
+```
+
+**Observaciones influyentes.** La distancia de Cook combina residual y apalancamiento: mide cuánto cambiarían todos los coeficientes si se quitara ese crédito. Una regla común marca los valores mayores a $4/n$:
+
+```{r}
+cook <- cooks.distance(modelo)
+c(maxima = max(cook), mayores_a_4_entre_n = sum(cook > 4 / nrow(hipotecas)), mayores_a_1 = sum(cook > 1))
+sin_influyentes <- update(modelo, data = hipotecas[cook <= 4 / nrow(hipotecas), ])
+round(100 * cbind(todos = coef(modelo), sin_influyentes = coef(sin_influyentes))[grep("banda_fico", names(coef(modelo))), ], 1)
+```
+
+**Varianza no constante.** Si la varianza de los errores cambia con las variables, los coeficientes siguen siendo insesgados, pero sus errores estándar usuales son incorrectos. Los errores estándar **robustos** (de White, versión HC3) no suponen varianza constante:
+
+```{r}
+lmtest::bptest(modelo)
+robustos <- lmtest::coeftest(modelo, vcov. = sandwich::vcovHC(modelo, type = "HC3"))
+cmp <- cbind(ee_usual = coef(summary(modelo))[, "Std. Error"], ee_robusto = robustos[, "Std. Error"])
+round(100 * cmp[grep("banda_fico|proposito|ocupacion", rownames(cmp)), ], 2)
+```
+
+### 2.3.9 Pruebas de hipótesis acerca de los coeficientes
+### 2.3.10 Formulación matricial de la prueba lineal general
+
+La **prueba lineal general** compara un modelo completo con uno reducido, o equivalentemente prueba $H_0: \mathbf{C}\boldsymbol\beta = \mathbf{0}$:
+
+$$
+F = \frac{(SCE_{\text{reducido}} - SCE_{\text{completo}})/q}{SCE_{\text{completo}}/(n - p)} \sim F_{q,\,n-p} \text{ bajo } H_0 .
+$$
+
+**¿Importa el mes?** (11 coeficientes iguales a cero):
+
+```{r}
+anova(update(modelo, . ~ . - mes), modelo)
+```
+
+**¿La tasa deja de subir cuando el LTV pasa de 80?** Arriba de 80, Freddie Mac exige seguro hipotecario, que protege al prestamista. $H_0$: las bandas de LTV de 80–85, 85–90, 90–95 y más de 95 tienen el mismo efecto que la de 75–80 (la referencia). En forma matricial, $\mathbf{C}$ selecciona esos cuatro coeficientes:
+
+```{r}
+car::linearHypothesis(modelo, c("banda_ltv80–85 = 0", "banda_ltv85–90 = 0", "banda_ltv90–95 = 0", "banda_ltv>95 = 0"))
+round(100 * coef(modelo)[grep("banda_ltv", names(coef(modelo)))], 1)
+```
+
+La prueba rechaza que las cuatro bandas sean *exactamente* iguales a la de 75–80, pero mira los coeficientes: arriba de 80 todas quedan a unos pocos puntos base de la referencia, unas arriba y otras abajo. En cambio, bajar el LTV de 75–80 a 60 o menos ahorra más de 25 puntos base. La forma es clara: **la tasa sube con el LTV hasta 80 y ahí se aplana**. Arriba de 80, el riesgo adicional lo cubre el seguro hipotecario, que el acreditado paga por separado y no en la tasa. Es otro caso de diferencia significativa pero pequeña: con 46,000 créditos, la prueba detecta diferencias de 3 o 4 puntos base que en la práctica son casi irrelevantes.
+
+**¿Hacen falta las bandas de FICO, o basta una recta?** Con todo el año y ajustando por el mes, repetimos la comparación del capítulo 2:
+
+```{r}
+recta <- update(modelo, . ~ . - banda_fico + fico)
+anova(recta, update(modelo, . ~ . + fico))
+c(AIC_recta = AIC(recta), AIC_bandas = AIC(modelo))
+```
+
+### 2.3.11 Coeficientes de determinación parcial
+
+¿Qué parte de la variación que *no* explican las demás variables explica cada bloque?
+
+$$
+R^2_{\text{parcial}} = \frac{SCE_{\text{sin el bloque}} - SCE_{\text{completo}}}{SCE_{\text{sin el bloque}}}.
+$$
+
+```{r}
+sce <- function(m) sum(residuals(m)^2)
+bloques <- c("mes", "banda_fico", "banda_ltv", "proposito", "ocupacion", "dti", "log(monto)")
+parcial <- sapply(bloques, function(b) {
+  reducido <- update(modelo, as.formula(paste(". ~ . -", b)))
+  (sce(reducido) - sce(modelo)) / sce(reducido)
+})
+round(sort(parcial, decreasing = TRUE), 4)
+```
+
+El **mes** es, por mucho, el bloque más importante: explica `r round(100 * parcial[["mes"]])`% de la variación que no explican las demás variables. Después vienen la ocupación, el LTV, el propósito y el FICO, cada uno con unos pocos puntos porcentuales; el DTI y el monto casi no aportan una vez considerado lo demás. Para la pregunta del curso, esto confirma lo que sospechábamos en el capítulo 0: **cualquier comparación de tasas que no controle el momento del mercado está contaminada**.
+
+### 2.3.12 Multicolinealidad y sus efectos
+
+El LTV y el LTV combinado (CLTV, que suma segundas hipotecas) miden casi lo mismo. El factor de inflación de varianza (VIF) dice cuánto crece la varianza de un coeficiente por su correlación con las demás variables:
+
+```{r}
+continuas <- lm(tasa ~ ltv + cltv + fico + dti + log(monto), data = hipotecas)
+round(car::vif(continuas), 1)
+c(correlacion_ltv_cltv = cor(hipotecas$ltv, hipotecas$cltv))
+round(100 * cbind(solo_ltv = coef(summary(update(continuas, . ~ . - cltv)))["ltv", 1:2],
+                  con_cltv = coef(summary(continuas))["ltv", 1:2]), 2)
+```
+
+Con las dos en el modelo, el error estándar del coeficiente de LTV se dispara y su estimación cambia: el modelo no puede separar dos variables que se mueven juntas. Por eso el modelo base usa solo el LTV.
+
+**El caso del seguro hipotecario.** En el capítulo 1, la prueba de McNemar mostró que "LTV mayor a 80" y "tiene seguro" coinciden en casi todos los créditos. Una variable que casi es función exacta de otras es multicolinealidad pura. Veamos qué pasa si la agregamos al modelo base (el VIF generalizado, para variables con varios niveles, se compara en la escala $GVIF^{1/(2\,gl)}$, donde un valor mayor a 2 o 3 ya preocupa):
+
+```{r}
+con_seguro <- update(modelo, . ~ . + seguro_hipotecario)
+round(car::vif(con_seguro)[, "GVIF^(1/(2*Df))"], 2)
+efecto <- function(m, v) round(100 * c(coef(m)[v], confint(m)[v, ]), 1)
+rbind(sin_seguro = efecto(modelo, "banda_ltv85–90"), con_seguro = efecto(con_seguro, "banda_ltv85–90"))
+efecto(con_seguro, "seguro_hipotecarioTRUE")
+```
+
+El seguro tiene un VIF enorme frente a las demás variables, su coeficiente no se distingue de cero y, al agregarlo, los intervalos de las bandas de LTV mayores a 80 se vuelven varias veces más anchos: el modelo no puede decidir si un efecto viene del LTV alto o del seguro, porque casi nunca aparece uno sin el otro. La información del seguro ya está en el LTV, y por eso queda fuera del modelo base. En el resto de las variables el VIF es cercano a 1.
+
+## 2.4 Selección de modelos
+
+### 2.4.1 Métodos de selección de variables
+
+Partimos del modelo base y dejamos que la selección por pasos decida si agregar el canal, el CLTV, ser comprador primerizo o quitar variables. Con AIC (que penaliza cada parámetro con 2) y con BIC (que penaliza con $\log n$, más estricto con muestras grandes):
+
+```{r}
+alcance <- list(lower = ~ mes, upper = ~ mes + banda_fico + banda_ltv + dti + log(monto) + proposito + ocupacion +
+                  seguro_hipotecario + varios_acreditados + varias_unidades + canal + cltv + primer_comprador)
+por_aic <- step(modelo, scope = alcance, direction = "both", trace = 0)
+por_bic <- step(modelo, scope = alcance, direction = "both", trace = 0, k = log(nrow(hipotecas)))
+list(agregadas_aic = setdiff(attr(terms(por_aic), "term.labels"), attr(terms(modelo), "term.labels")),
+     quitadas_aic = setdiff(attr(terms(modelo), "term.labels"), attr(terms(por_aic), "term.labels")),
+     agregadas_bic = setdiff(attr(terms(por_bic), "term.labels"), attr(terms(modelo), "term.labels")),
+     quitadas_bic = setdiff(attr(terms(modelo), "term.labels"), attr(terms(por_bic), "term.labels")))
+```
+
+**Validación cruzada.** Los criterios de información estiman qué tan bien predeciría el modelo datos nuevos; la validación cruzada lo mide directamente. Partimos los créditos en 5 grupos, ajustamos con 4 y medimos el error en el quinto:
+
+```{r}
+pliegue <- sample(rep(1:5, length.out = nrow(hipotecas)))
+ecm_cv <- function(f) {
+  mean(sapply(1:5, function(k) {
+    ajuste <- lm(f, data = hipotecas[pliegue != k, ])
+    prueba <- hipotecas[pliegue == k, ]
+    sqrt(mean((prueba$tasa - predict(ajuste, prueba))^2))
+  }))
+}
+candidatos <- list(solo_promedio = tasa ~ 1, solo_mes = tasa ~ mes, mes_y_fico = tasa ~ mes + banda_fico,
+                   base = formula_base, seleccion_aic = formula(por_aic), seleccion_bic = formula(por_bic))
+round(sapply(candidatos, ecm_cv), 4)
+```
+
+Lo que dicen los dos métodos:
+
+- Ambos **quitan el logaritmo del monto** (su aporte es mínimo) y **agregan** ser comprador primerizo y el CLTV (que, junto con las bandas de LTV, distingue a quien tiene una segunda hipoteca).
+- El AIC agrega además el **canal**; el BIC, más estricto con muestras grandes, no lo agrega. Es una primera pista para el capítulo 4: si el canal importa, importa poco.
+- En validación cruzada, la diferencia entre el modelo base y los seleccionados está en el **tercer decimal** del error de predicción. Casi toda la capacidad predictiva viene del mes y de las variables de riesgo. Con muestras grandes, la selección de variables importa poco para *predecir* y mucho para *interpretar*: decidir qué variables entran cambia lo que dice cada coeficiente.
+
+### 2.4.2 Uso de un paquete estadístico
+
+Todo lo anterior usa `lm()`, `anova()`, `step()` y tres paquetes: `car` (prueba lineal general, VIF), `sandwich` y `lmtest` (errores robustos, Breusch y Pagan).
+
+## La respuesta a la primera pregunta
+
+**¿Cuánto más paga un acreditado con peor historial, comparado con uno igual en todo lo demás?** Contra un FICO de 780 o más, mismo mes, mismo enganche, mismo propósito y misma ocupación:
+
+```{r}
+fico_efecto <- coeficientes |> filter(grepl("banda_fico", variable)) |>
+  transmute(banda = sub("banda_fico", "", variable), puntos_base = round(efecto_pb, 1),
+            dolares_al_mes = round(sapply(efecto_pb, function(pb) costo_pb(pb)[["por_mes"]]), 0),
+            dolares_en_30_anios = round(sapply(efecto_pb, function(pb) costo_pb(pb)[["en_30_anios"]]), -2))
+knitr::kable(fico_efecto)
+```
+
+(Pagos calculados sobre un crédito de 300,000 dólares a 30 años con tasa base de 6.6%.)
+
+- El castigo por peor historial es **gradual y no lineal**: casi nulo entre 760 y 779, y de unos `r round(fico_efecto$puntos_base[fico_efecto$banda == "660–679"])` puntos base para un FICO de 660–679.
+- Con todo el año y ajustando por el mes, los datos sí distinguen la forma por bandas de una recta (2.3.10), cosa que con un solo mes no podían (capítulo 2): **más datos permiten ver formas que una muestra chica no ve**.
+- El FICO no es lo que más pesa en la tasa. El **mes** del mercado, la **ocupación** (una vivienda de inversión o segunda vivienda paga alrededor de medio punto más) y el **retiro de efectivo** pesan igual o más.
+
+Falta la segunda pregunta: **¿los brókers cobran más, a igual riesgo?** Eso es un análisis de covarianza, en el capítulo 4.

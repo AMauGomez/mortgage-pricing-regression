@@ -1,0 +1,147 @@
+---
+title: "Do mortgage brokers charge more?"
+subtitle: "What sets the interest rate on a US mortgage: nonparametric tests, linear regression, ANCOVA and MANCOVA on 46,000 loans originated in 2024"
+author: "Aaron Mauricio Gómez Jiménez"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+source("chapters/funciones-caso.R")
+h <- leer_hipotecas() |>
+  mutate(banda_fico = relevel(banda_fico(fico), "780+"), banda_ltv = relevel(banda_ltv(ltv), "75–80"),
+         varios_acreditados = acreditados > 1, varias_unidades = unidades > 1)
+f0 <- function(x) format(round(x), big.mark = ",")
+covs <- ~ mes + banda_fico + banda_ltv + dti + log(monto) + proposito + ocupacion + varios_acreditados + varias_unidades
+base <- lm(update(covs, tasa ~ .), data = h)
+ancova <- lm(update(covs, tasa ~ canal + .), data = h)
+# Same as chapter 4: contrasts vs retail with Dunnett adjustment for the two comparisons
+mm <- emmeans::emmeans(ancova, "canal", nuisance = c("mes", "banda_fico", "banda_ltv", "proposito", "ocupacion",
+                                                     "varios_acreditados", "varias_unidades"), weights = "proportional")
+ct <- summary(emmeans::contrast(mm, "trt.vs.ctrl", ref = 1), infer = TRUE)
+broker <- 100 * c(ct$estimate[1], ct$lower.CL[1], ct$upper.CL[1])
+corresp <- 100 * c(ct$estimate[2], ct$lower.CL[2], ct$upper.CL[2])
+raw <- h |> group_by(canal) |> summarise(m = mean(tasa))
+raw_b <- 100 * (raw$m[raw$canal == "Bróker"] - raw$m[raw$canal == "Banco directo"])
+raw_c <- 100 * (raw$m[raw$canal == "Corresponsal"] - raw$m[raw$canal == "Banco directo"])
+fico_fx <- data.frame(band = levels(h$banda_fico)[-1], pb = 100 * coef(base)[paste0("banda_fico", levels(h$banda_fico)[-1])],
+                      lo = 100 * confint(base)[paste0("banda_fico", levels(h$banda_fico)[-1]), 1],
+                      hi = 100 * confint(base)[paste0("banda_fico", levels(h$banda_fico)[-1]), 2])
+monthly <- h |> group_by(mes) |> summarise(rate = median(tasa))
+sce <- function(m) sum(residuals(m)^2)
+partial_month <- (sce(update(base, . ~ . - mes)) - sce(base)) / sce(update(base, . ~ . - mes))
+usd <- function(p) unname(costo_pb(unname(p))["por_mes"])
+```
+
+**November 2026** · R · Teaching case and portfolio project · [Code](https://github.com/AMauGomez/mortgage-pricing-regression) · Data: [Freddie Mac Single-Family Loan-Level Dataset](https://freddiemac.com/research/datasets/sf-loanlevel-dataset)
+
+::: {.callout-note appearance="simple"}
+**Author's note.** This is the running case study of the *Nonparametric and Regression Models* course I teach at the Facultad de Ciencias, UNAM (syllabus 1639). Each chapter answers part of the question with one unit of the syllabus: nonparametric tests, simple regression, multiple regression and model selection, ANOVA and ANCOVA. The chapters are in Spanish (links below); this page summarises them.
+:::
+
+```{=html}
+<style>
+.flow{display:flex;flex-wrap:wrap;gap:.6rem;margin:1.2rem 0 .4rem;align-items:stretch}
+.flow .step{flex:1 1 160px;border:1px solid #dadce0;border-radius:10px;padding:.75rem .8rem;background:#fafbfc}
+.flow .step .n{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:#5f6368}
+.flow .step .big{font-size:1.35rem;font-weight:700;line-height:1.15;margin:.2rem 0}
+.flow .step .txt{font-size:.85rem;color:#3c4043;line-height:1.3}
+.flow .step.hl{border-color:#1a73e8;background:#e8f0fe}
+</style>
+```
+
+```{r}
+#| results: asis
+cat(sprintf('<div class="flow">
+ <div class="step"><div class="n">Data</div><div class="big">%s</div><div class="txt">30-year mortgages with first payment Mar 2024 – Feb 2025 (Freddie Mac)</div></div>
+ <div class="step hl"><div class="n">Brokers vs retail</div><div class="big">%+.1f bp</div><div class="txt">same month and risk profile; 95%% CI %.1f to %+.1f bp (Dunnett)</div></div>
+ <div class="step"><div class="n">FICO 660–679 vs 780+</div><div class="big">+%.0f bp</div><div class="txt">about $%.0f a month on a $300k loan</div></div>
+ <div class="step hl"><div class="n">Biggest driver</div><div class="big">the month</div><div class="txt">%.0f%% partial R², more than any borrower characteristic</div></div>
+</div>', f0(nrow(h)), broker[1], broker[2], broker[3], fico_fx$pb[fico_fx$band == "660–679"],
+  usd(fico_fx$pb[fico_fx$band == "660–679"]), 100 * partial_month))
+```
+
+## The question
+
+Two people take out the same mortgage in the same month. One has an excellent credit history, the other an average one; one goes straight to a bank, the other through a **broker**. Do they pay the same rate? Two questions, answered with the 50,000-loan 2024 sample that Freddie Mac publishes:
+
+1. **How much more does a borrower with a weaker credit score pay, all else equal?**
+2. **Do brokers charge more than retail lenders, for the same risk?**
+
+## Answer 1: a weaker score costs up to a third of a point
+
+Comparing loans locked in the same month, with the same down payment, purpose and occupancy, a FICO of 660–679 pays about **`r round(fico_fx$pb[fico_fx$band == "660–679"])` basis points** more than a FICO of 780 or above (roughly **$`r round(usd(fico_fx$pb[fico_fx$band == "660–679"]))` a month** on a $300,000 loan). The penalty is gradual and non-linear: almost nothing between 760 and 779, a third of a point below 640.
+
+```{r}
+#| label: fico-plot
+#| fig-height: 3.4
+ggplot(transform(fico_fx, band = factor(band, band)), aes(band, pb)) + geom_hline(yintercept = 0, colour = GRIS) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), colour = AZUL) +
+  labs(x = "FICO band", y = "Basis points above FICO 780+",
+       title = "Rate premium by credit score, all else equal (multiple regression)")
+```
+
+The borrower's score is not the main driver, though. The **month** the rate was locked explains `r round(100 * partial_month)`% of the variation the other variables leave unexplained: the median rate swung from `r sprintf("%.2f", min(monthly$rate))`% to `r sprintf("%.2f", max(monthly$rate))`% during the year. Investment properties and second homes pay about half a point more, and cash-out refinances about 0.3 points more.
+
+## Answer 2: no, brokers do not charge more on average
+
+```{r}
+#| label: channel-plot
+#| fig-height: 2.8
+data.frame(channel = rep(c("Broker", "Correspondent"), 2), type = rep(c("raw", "adjusted (ANCOVA)"), each = 2),
+           est = c(raw_b, raw_c, broker[1], corresp[1]), lo = c(NA, NA, broker[2], corresp[2]), hi = c(NA, NA, broker[3], corresp[3])) |>
+  ggplot(aes(est, channel, colour = type)) + geom_vline(xintercept = 0, colour = GRIS) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, position = position_dodge(width = 0.4), na.rm = TRUE) +
+  scale_colour_manual(values = c("raw" = GRIS, "adjusted (ANCOVA)" = AZUL)) +
+  labs(x = "Basis points of rate vs retail (bank-originated) loans", y = NULL, colour = NULL) + theme(legend.position = "top")
+```
+
+- **Brokers:** `r sprintf("%+.1f", broker[1])` bp vs retail (95% CI `r sprintf("%.1f", broker[2])` to `r sprintf("%+.1f", broker[3])`). The interval rules out an average premium of more than about `r sprintf("%.0f", broker[3])` bp, under $`r round(usd(broker[3]))` a month.
+- **Correspondents** charge slightly more: `r sprintf("%+.1f", corresp[1])` bp (95% CI `r sprintf("%.1f", corresp[2])` to `r sprintf("%.1f", corresp[3])`): statistically clear, economically small.
+- **The raw comparison points the wrong way for correspondents.** Unadjusted, they look `r sprintf("%.1f", abs(raw_c))` bp *cheaper*, because retail lenders write twice as many cash-out refinances, which carry a higher rate. Comparing groups without adjusting can reverse the answer.
+- The gap is not identical for everyone: brokers are a few basis points cheaper for prime borrowers (FICO 740+) and a few more expensive in the mid range (660–739).
+
+## Beyond the rate: MANOVA and MANCOVA
+
+A loan is a package, not just a rate. Testing **rate, loan-to-value, debt-to-income and loan size jointly** (MANOVA, Pillai's trace, with all four statistics also computed by hand from the eigenvalues of $\mathbf{E}^{-1}\mathbf{H}$), the channels clearly differ, but the effect is small and **the rate is not where they differ**:
+
+- Follow-up ANOVAs (Bonferroni) and a canonical discriminant analysis show that 98% of the separation comes from **loan size and down payment**.
+- A **MANCOVA** adjusting for credit score and month gives the same answer: broker loans are about 25% larger, with 3.5 more points of LTV and 1.4 more of DTI, at the same rate.
+
+Brokers do not charge more; they serve a different kind of loan.
+
+## What makes the analysis trustworthy
+
+- **Nonparametric first.** Rates are discrete and heaped: 76% sit on the 1/8-point grid and most of the rest end in .99 or .49, so normality tests fail and rank-based tests (Mann–Whitney, Kruskal–Wallis, Fligner–Killeen) come first. With 46,000 loans, several tests are "significant" for differences of zero or one basis point; every result is reported as an effect size.
+- **Data checks with the right test.** McNemar's test on "LTV above 80" vs "has mortgage insurance" finds a few inconsistent loans, and the same near-identity later shows up as severe **multicollinearity** (generalised VIF of 14.8) if both enter the model.
+- **Form of the relationship.** Within a single month a straight line in FICO is adequate (lack-of-fit F test, AIC); with the full year and month adjustment, score bands fit clearly better: more data reveals shape.
+- **Assumptions checked, not assumed.** Breusch–Pagan rejects constant variance, so results are confirmed with HC3 robust standard errors; homogeneity of slopes is tested before reading an ANCOVA; conclusions hold with extra controls and in the most homogeneous segment.
+- **What the data cannot say.** The dataset records the rate, not fees or discount points, so the answer is "same rate", not "same total cost"; and channel choice is not random, so the adjusted gap is an association, not a causal effect.
+
+## The chapters (in Spanish)
+
+| | Chapter | Syllabus unit | What it finds |
+|---|---|---|---|
+| 0 | [The question](chapters/0-la-pregunta.html) | — | The data, the two questions, why a raw comparison is not enough |
+| 1 | [Nonparametric tests](chapters/1-pruebas-no-parametricas.html) | 1 | Binomial, sign, McNemar, Cox–Stuart, Mann–Whitney, Kruskal–Wallis, Fligner, goodness of fit, contingency tables |
+| 2 | [Simple linear regression](chapters/2-regresion-lineal-simple.html) | 2.1–2.2 | Least squares by hand, Gauss–Markov, MLE, confidence vs prediction intervals, residuals, lack-of-fit F test, matrix form |
+| 3 | [Multiple regression and model selection](chapters/3-regresion-multiple.html) | 2.3–2.4 | Matrix estimation, leverage and Cook's distance, robust SEs, general linear test, partial R², multicollinearity, stepwise AIC/BIC, cross-validation |
+| 4 | [ANOVA and ANCOVA](chapters/4-anova-y-ancova.html) | 2.5–2.6 | One- and two-way ANOVA, Welch, Tukey, ANCOVA, homogeneity of slopes, adjusted means, robustness: the answer |
+| 5 | [MANOVA and MANCOVA](chapters/5-manova-y-mancova.html) | beyond (Multivariate Analysis) | Wilks, Pillai, Hotelling–Lawley and Roy by hand, multivariate normality, Box's M, Bonferroni follow-ups, canonical discriminant analysis, MANCOVA |
+
+**Data:** the loan-level data are not included (Freddie Mac's terms allow publishing research results, not the data); no individual loan is shown anywhere. Freddie Mac provides the dataset "as is" and does not endorse this analysis.
+
+**Skills shown:** nonparametric inference · linear regression and diagnostics · general linear hypothesis · multicollinearity · model selection and cross-validation · ANOVA, ANCOVA, MANOVA and MANCOVA · discriminant analysis · robust standard errors · effect sizes vs significance · R
+
+---
+
+Code: MIT License. Aaron Mauricio Gómez Jiménez · [LinkedIn](https://www.linkedin.com/in/amaugomezjimenez) · [ORCID](https://orcid.org/0009-0003-1099-0431)
